@@ -1,0 +1,645 @@
+name: checkruns
+run-name: "Checkruns for ${{ github.ref_name }} by ${{ github.actor }}"
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Test
+        run: npm test --if-present
+
+  package:
+    name: Package (Docker Build + Push)
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Bootstrap ECR Repository
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          echo "Checking if ECR Repository $REPO_NAME exists..."
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ap-southeast-1 >/dev/null 2>&1; then
+            echo "Creating ECR Repository $REPO_NAME..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --region ap-southeast-1
+          fi
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          docker build -t $ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  gitleaks:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        run: |
+          mkdir -p reports
+          docker run --rm -v "${PWD}:/path" zricethezav/gitleaks:latest detect --source="/path" --report-format=json --report-path="/path/reports/gitleaks-report.json" --verbose --redact || true
+      - name: Upload Gitleaks Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: reports/gitleaks-report.json
+
+  opengrep:
+    name: SAST Scan (Opengrep)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Opengrep
+        run: |
+          mkdir -p reports
+          docker run --rm -v "${PWD}:/src" opengrep/opengrep scan --config auto --severity ERROR --json --output /src/reports/opengrep-report.json || true
+          # Ensure the report file always exists so the artifact upload doesn't fail
+          if [ ! -f reports/opengrep-report.json ]; then
+            echo '{"results":[],"errors":[],"version":"0.0.0"}' > reports/opengrep-report.json
+          fi
+      - name: Upload Opengrep Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: opengrep-report
+          path: reports/opengrep-report.json
+          if-no-files-found: warn
+
+  trivy:
+    name: Container Scan + SBOM (Trivy)
+    runs-on: ubuntu-latest
+    needs: [package]
+    continue-on-error: true
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.package.outputs.image }}
+          format: 'json'
+          output: 'trivy-report.json'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.package.outputs.image }}
+          format: 'spdx-json'
+          output: 'sbom.spdx.json'
+
+      - name: Organize Reports
+        run: |
+          mkdir -p reports
+          mv trivy-report.json sbom.spdx.json reports/
+
+      - name: Upload Trivy Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: |
+            reports/trivy-report.json
+            reports/sbom.spdx.json
+
+  report:
+    name: Compile Verification Report
+    runs-on: ubuntu-latest
+    needs: [package, gitleaks, opengrep, trivy]
+    steps:
+      - name: Create Reports Dir
+        run: mkdir -p reports
+
+      - name: Download Gitleaks Report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: gitleaks-report
+          path: reports/
+
+      - name: Download Opengrep Report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: opengrep-report
+          path: reports/
+
+      - name: Download Trivy Reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-reports
+          path: reports/
+
+      - name: Compile HTML Dashboard
+        run: |
+          cat << 'EOF' > generate-report.js
+          const fs = require('fs');
+          const path = require('path');
+
+          function readJson(file) {
+            try {
+              if (fs.existsSync(file)) {
+                const content = fs.readFileSync(file, 'utf8').trim();
+                return content ? JSON.parse(content) : null;
+              }
+            } catch (e) {
+              console.error(`Error reading ${file}:`, e);
+            }
+            return null;
+          }
+
+          const gitleaks = readJson('reports/gitleaks-report.json') || [];
+          const opengrep = readJson('reports/opengrep-report.json') || { results: [] };
+          const trivy = readJson('reports/trivy-report.json') || {};
+          const sbom = readJson('reports/sbom.spdx.json') || { packages: [] };
+
+          let cves = [];
+          if (trivy && trivy.Results) {
+            trivy.Results.forEach(r => {
+              if (r.Vulnerabilities) {
+                r.Vulnerabilities.forEach(v => {
+                  cves.push({
+                    id: v.VulnerabilityID || 'N/A',
+                    pkg: v.PkgName || 'N/A',
+                    version: v.InstalledVersion || 'N/A',
+                    fixed: v.FixedVersion || 'N/A',
+                    severity: v.Severity || 'UNKNOWN',
+                    title: v.Title || 'No Title',
+                    url: v.PrimaryURL || '#'
+                  });
+                });
+              }
+            });
+          }
+
+          const critCount = cves.filter(c => c.severity === 'CRITICAL').length;
+          const highCount = cves.filter(c => c.severity === 'HIGH').length;
+          const medCount = cves.filter(c => c.severity === 'MEDIUM').length;
+          const lowCount = cves.filter(c => c.severity === 'LOW').length;
+          const totalCves = cves.length;
+
+          const secretsCount = gitleaks.length;
+          const sastCount = opengrep.results ? opengrep.results.length : 0;
+          const packagesCount = sbom.packages ? sbom.packages.length : 0;
+
+          // Simple SVG pie/donut chart parameters
+          const totalIssues = critCount + highCount + medCount + lowCount;
+          
+          let svgChart = '';
+          if (totalIssues > 0) {
+            const r = 50;
+            const c = 2 * Math.PI * r;
+            let offset = 0;
+            
+            const slices = [
+              { count: critCount, color: '#ef4444', name: 'Critical' },
+              { count: highCount, color: '#f97316', name: 'High' },
+              { count: medCount, color: '#f59e0b', name: 'Medium' },
+              { count: lowCount, color: '#3b82f6', name: 'Low' }
+            ];
+            
+            svgChart = `<svg width="200" height="200" viewBox="0 0 140 140" style="transform: rotate(-90deg)">
+              <circle cx="70" cy="70" r="${r}" fill="transparent" stroke="#1e293b" stroke-width="20" />`;
+            
+            slices.forEach(slice => {
+              if (slice.count > 0) {
+                const dash = (slice.count / totalIssues) * c;
+                svgChart += `\n  <circle cx="70" cy="70" r="${r}" fill="transparent" stroke="${slice.color}" stroke-dasharray="${dash} ${c - dash}" stroke-dashoffset="${-offset}" stroke-width="20" />`;
+                offset += dash;
+              }
+            });
+            svgChart += `\n  <circle cx="70" cy="70" r="40" fill="#0f172a" />
+              <text x="70" y="75" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold" text-anchor="middle" style="transform: rotate(90deg); transform-origin: 70px 70px;">${totalIssues} CVEs</text>
+            </svg>`;
+          } else {
+            svgChart = `<svg width="200" height="200" viewBox="0 0 140 140">
+              <circle cx="70" cy="70" r="50" fill="transparent" stroke="#10b981" stroke-width="20" />
+              <circle cx="70" cy="70" r="40" fill="#0f172a" />
+              <text x="70" y="75" fill="#10b981" font-family="sans-serif" font-size="12" font-weight="bold" text-anchor="middle">Secure</text>
+            </svg>`;
+          }
+
+          const htmlTemplate = `<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Build Verification & Security Report - ${process.env.VERSION || 'v1.0.0'}</title>
+            <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+            <style>
+              :root {
+                --bg-dark: #0f172a;
+                --panel-bg: rgba(30, 41, 59, 0.7);
+                --border-color: rgba(255, 255, 255, 0.08);
+                --text-main: #f8fafc;
+                --text-muted: #94a3b8;
+                --color-critical: #ef4444;
+                --color-high: #f97316;
+                --color-medium: #f59e0b;
+                --color-low: #3b82f6;
+                --color-success: #10b981;
+              }
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                background-color: var(--bg-dark);
+                color: var(--text-main);
+                font-family: 'Outfit', sans-serif;
+                padding: 2rem;
+                line-height: 1.5;
+              }
+              header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid var(--border-color);
+                padding-bottom: 1.5rem;
+                margin-bottom: 2rem;
+              }
+              h1 { font-size: 1.8rem; font-weight: 800; letter-spacing: -0.025em; }
+              .badge {
+                display: inline-block;
+                padding: 0.25rem 0.75rem;
+                border-radius: 9999px;
+                font-size: 0.85rem;
+                font-weight: 600;
+              }
+              .badge-success { background-color: rgba(16, 185, 129, 0.15); color: var(--color-success); border: 1px solid rgba(16, 185, 129, 0.3); }
+              .badge-fail { background-color: rgba(239, 68, 68, 0.15); color: var(--color-critical); border: 1px solid rgba(239, 68, 68, 0.3); }
+              
+              .dashboard {
+                display: grid;
+                grid-template-columns: 1fr 300px;
+                gap: 1.5rem;
+                margin-bottom: 2rem;
+              }
+              @media (max-width: 900px) {
+                .dashboard { grid-template-columns: 1fr; }
+              }
+              .cards-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+                gap: 1rem;
+              }
+              .card {
+                background: var(--panel-bg);
+                border: 1px solid var(--border-color);
+                border-radius: 12px;
+                padding: 1.5rem;
+                backdrop-filter: blur(8px);
+                position: relative;
+                overflow: hidden;
+              }
+              .card-title { font-size: 0.9rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-bottom: 0.5rem; }
+              .card-val { font-size: 2.2rem; font-weight: 800; }
+              .card-indicator {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                width: 100%;
+                height: 4px;
+              }
+              
+              .chart-card {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                text-align: center;
+              }
+              
+              .tabs {
+                display: flex;
+                border-bottom: 1px solid var(--border-color);
+                margin-bottom: 1.5rem;
+                gap: 0.5rem;
+              }
+              .tab-btn {
+                background: transparent;
+                border: none;
+                color: var(--text-muted);
+                padding: 0.75rem 1.25rem;
+                font-family: inherit;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                border-bottom: 2px solid transparent;
+                transition: all 0.2s;
+              }
+              .tab-btn:hover { color: var(--text-main); }
+              .tab-btn.active { color: var(--text-main); border-bottom-color: var(--color-low); }
+              
+              .tab-content { display: none; }
+              .tab-content.active { display: block; }
+              
+              table {
+                width: 100%;
+                border-collapse: collapse;
+                background: var(--panel-bg);
+                border: 1px solid var(--border-color);
+                border-radius: 8px;
+                overflow: hidden;
+                margin-top: 1rem;
+              }
+              th, td { padding: 1rem; text-align: left; border-bottom: 1px solid var(--border-color); }
+              th { background: rgba(15, 23, 42, 0.5); font-weight: 600; font-size: 0.9rem; color: var(--text-muted); }
+              tr:last-child td { border-bottom: none; }
+              
+              .search-container {
+                display: flex;
+                gap: 1rem;
+                margin-bottom: 1rem;
+              }
+              input[type="text"] {
+                flex: 1;
+                background: var(--panel-bg);
+                border: 1px solid var(--border-color);
+                border-radius: 8px;
+                padding: 0.75rem 1rem;
+                color: var(--text-main);
+                font-family: inherit;
+                font-size: 1rem;
+              }
+              input[type="text"]:focus { outline: none; border-color: var(--color-low); }
+              
+              .empty-state { text-align: center; padding: 3rem; color: var(--text-muted); }
+              .mono { font-family: 'JetBrains Mono', monospace; font-size: 0.9rem; }
+              
+              .sev-CRITICAL { color: var(--color-critical); font-weight: bold; }
+              .sev-HIGH { color: var(--color-high); font-weight: bold; }
+              .sev-MEDIUM { color: var(--color-medium); font-weight: bold; }
+              .sev-LOW { color: var(--color-low); }
+            </style>
+          </head>
+          <body>
+            <header>
+              <div>
+                <h1 style="margin-bottom: 0.25rem;">Verification Report</h1>
+                <p style="color: var(--text-muted);">Release Tag: <span class="mono">${process.env.VERSION || 'v1.0.0'}</span></p>
+              </div>
+              <span class="badge ${totalIssues === 0 && secretsCount === 0 && sastCount === 0 ? 'badge-success' : 'badge-fail'}">
+                ${totalIssues === 0 && secretsCount === 0 && sastCount === 0 ? 'SECURE' : 'ACTION REQUIRED'}
+              </span>
+            </header>
+
+            <section class="dashboard">
+              <div class="cards-grid">
+                <div class="card">
+                  <div class="card-title">Secret Leaks</div>
+                  <div class="card-val">${secretsCount}</div>
+                  <div class="card-indicator" style="background-color: ${secretsCount > 0 ? 'var(--color-critical)' : 'var(--color-success)'}"></div>
+                </div>
+                <div class="card">
+                  <div class="card-title">SAST Findings</div>
+                  <div class="card-val">${sastCount}</div>
+                  <div class="card-indicator" style="background-color: ${sastCount > 0 ? 'var(--color-high)' : 'var(--color-success)'}"></div>
+                </div>
+                <div class="card">
+                  <div class="card-title">Container CVEs</div>
+                  <div class="card-val">${totalCves}</div>
+                  <div class="card-indicator" style="background-color: ${totalCves > 0 ? 'var(--color-medium)' : 'var(--color-success)'}"></div>
+                </div>
+                <div class="card">
+                  <div class="card-title">SBOM Packages</div>
+                  <div class="card-val">${packagesCount}</div>
+                  <div class="card-indicator" style="background-color: var(--color-low)"></div>
+                </div>
+              </div>
+              
+              <div class="card chart-card">
+                <div class="card-title" style="margin-bottom: 1rem;">Vulnerability Severity</div>
+                ${svgChart}
+              </div>
+            </section>
+
+            <nav class="tabs">
+              <button class="tab-btn active" onclick="switchTab(event, 'secrets')">Secrets (${secretsCount})</button>
+              <button class="tab-btn" onclick="switchTab(event, 'sast')">SAST Scan (${sastCount})</button>
+              <button class="tab-btn" onclick="switchTab(event, 'cves')">CVE Vulnerabilities (${totalCves})</button>
+              <button class="tab-btn" onclick="switchTab(event, 'sbom')">SBOM (${packagesCount})</button>
+            </nav>
+
+            <div id="secrets" class="tab-content active">
+              ${secretsCount > 0 ? `
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Rule</th>
+                      <th>File</th>
+                      <th>Line</th>
+                      <th>Match</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${gitleaks.map(s => `
+                      <tr>
+                        <td class="sev-CRITICAL">${s.Description || s.RuleID}</td>
+                        <td class="mono">${s.File}</td>
+                        <td>${s.StartLine}</td>
+                        <td class="mono" style="filter: blur(4px); transition: filter 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='blur(4px)'">${s.Secret ? s.Secret.substring(0, 16) + '...' : 'N/A'}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              ` : `<div class="empty-state">🎉 No credentials or secrets leaks found in source code.</div>`}
+            </div>
+
+            <div id="sast" class="tab-content">
+              ${sastCount > 0 ? `
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Rule ID</th>
+                      <th>File</th>
+                      <th>Line</th>
+                      <th>Severity</th>
+                      <th>Message</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${opengrep.results.map(r => `
+                      <tr>
+                        <td class="mono">${r.check_id}</td>
+                        <td class="mono">${r.path}</td>
+                        <td>${r.start ? r.start.line : 'N/A'}</td>
+                        <td class="sev-${r.extra && r.extra.severity ? r.extra.severity : 'LOW'}">${r.extra && r.extra.severity ? r.extra.severity : 'LOW'}</td>
+                        <td>${r.extra ? r.extra.message : 'N/A'}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              ` : `<div class="empty-state">🎉 No static application security vulnerabilities detected by Opengrep.</div>`}
+            </div>
+
+            <div id="cves" class="tab-content">
+              ${totalCves > 0 ? `
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Package</th>
+                      <th>Installed</th>
+                      <th>Fixed Version</th>
+                      <th>Severity</th>
+                      <th>Vulnerability</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${cves.map(c => `
+                      <tr>
+                        <td><a href="${c.url}" target="_blank" class="mono" style="color: var(--color-low);">${c.id}</a></td>
+                        <td>${c.pkg}</td>
+                        <td>${c.version}</td>
+                        <td>${c.fixed}</td>
+                        <td class="sev-${c.severity}">${c.severity}</td>
+                        <td>${c.title}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              ` : `<div class="empty-state">🎉 No container vulnerabilities found by Trivy.</div>`}
+            </div>
+
+            <div id="sbom" class="tab-content">
+              <div class="search-container">
+                <input type="text" id="sbom-search" placeholder="Filter packages by name, version or license..." oninput="filterSbom()">
+              </div>
+              ${packagesCount > 0 ? `
+                <table id="sbom-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Version</th>
+                      <th>Type / Format</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${sbom.packages.map(p => `
+                      <tr>
+                        <td class="mono" style="font-weight: 600;">${p.name}</td>
+                        <td class="mono">${p.versionInfo || 'N/A'}</td>
+                        <td>SPDX Package</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              ` : `<div class="empty-state">No SBOM packages list found.</div>`}
+            </div>
+
+            <script>
+              function switchTab(evt, tabId) {
+                const contents = document.querySelectorAll('.tab-content');
+                contents.forEach(c => c.classList.remove('active'));
+                
+                const tabs = document.querySelectorAll('.tab-btn');
+                tabs.forEach(t => t.classList.remove('active'));
+                
+                document.getElementById(tabId).classList.add('active');
+                evt.currentTarget.classList.add('active');
+              }
+
+              function filterSbom() {
+                const query = document.getElementById('sbom-search').value.toLowerCase();
+                const rows = document.querySelectorAll('#sbom-table tbody tr');
+                rows.forEach(row => {
+                  const text = row.textContent.toLowerCase();
+                  row.style.display = text.includes(query) ? '' : 'none';
+                });
+              }
+            </script>
+          </body>
+          </html>`;
+
+          fs.writeFileSync(`reports/report-${process.env.VERSION || 'v1.0.0'}.html`, htmlTemplate);
+          console.log(`Successfully generated report-${process.env.VERSION || 'v1.0.0'}.html`);
+
+          // Output basic text stats to console
+          console.log(`--- SUMMARY ---`);
+          console.log(`SECRETS_COUNT=${secretsCount}`);
+          console.log(`SAST_COUNT=${sastCount}`);
+          console.log(`CRITICAL_CVES=${critCount}`);
+          console.log(`HIGH_CVES=${highCount}`);
+          console.log(`TOTAL_CVES=${totalCves}`);
+          console.log(`PACKAGES_COUNT=${packagesCount}`);
+
+          // Enforce quality gate (fails the checkrun if critical issues exist)
+          const failed = secretsCount > 0 || critCount > 0;
+          if (failed) {
+            console.error("FAIL: Quality gate failed due to secret leaks or critical CVEs.");
+            process.exit(1);
+          }
+          EOF
+          node generate-report.js
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: Upload HTML Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-report-${{ github.ref_name }}
+          path: reports/report-${{ github.ref_name }}.html

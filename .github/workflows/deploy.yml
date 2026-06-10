@@ -1,0 +1,238 @@
+name: deploy-ecs
+on:
+  workflow_dispatch:
+
+env:
+  ECS_CLUSTER: apps-demo
+  AWS_REGION: ap-southeast-1
+  VPC_ID: vpc-09efeb48b032b4a0f
+  SUBNETS: subnet-0ab71af7a401bf795,subnet-0c634607107b2906a,subnet-0d3fbebb666ee00ab
+  SECURITY_GROUPS: sg-0b683aafb044b6aaf
+  EXECUTION_ROLE_ARN: arn:aws:iam::163078623513:role/forge-demo-task-execution-role
+  TASK_ROLE_ARN: arn:aws:iam::163078623513:role/forge-demo-task-role
+  ALB_LISTENER_ARN: arn:aws:elasticloadbalancing:ap-southeast-1:163078623513:listener/app/ecs-express-gateway-alb-de1f17f6/a90ce19bce723a94/b1e28cc6fad01336
+  ECR_ACCOUNT_ID: 163078623513
+
+jobs:
+  deploy:
+    name: Deploy to Amazon ECS
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Parse App Name Slug
+      id: app-info
+      run: |
+        # Repository name is forge.app.slug -> slug is the last part
+        REPO_NAME="${{ github.event.repository.name }}"
+        APP_NAME=$(echo "$REPO_NAME" | sed 's/forge.app.//')
+        echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+        echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      with:
+        registries: ${{ env.ECR_ACCOUNT_ID }}
+
+    - name: Bootstrap ECR Repository
+      run: |
+        REPO_NAME="forge.app.${{ env.APP_NAME }}"
+        echo "Checking if ECR Repository $REPO_NAME exists..."
+        if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "Creating ECR Repository $REPO_NAME..."
+          aws ecr create-repository --repository-name "$REPO_NAME" --region ${{ env.AWS_REGION }}
+        else
+          echo "ECR Repository $REPO_NAME already exists."
+        fi
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        ECR_REPOSITORY="forge.app.${{ env.APP_NAME }}"
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Bootstrap CloudWatch Log Group
+      run: |
+        LOG_GROUP="/aws/ecs/${{ env.ECS_CLUSTER }}/forge-app-${{ env.APP_NAME }}"
+        echo "Checking if CloudWatch Log Group $LOG_GROUP exists..."
+        if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region ${{ env.AWS_REGION }} --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" --output text | grep -q "$LOG_GROUP"; then
+          echo "Creating CloudWatch Log Group $LOG_GROUP..."
+          aws logs create-log-group --log-group-name "$LOG_GROUP" --region ${{ env.AWS_REGION }}
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 --region ${{ env.AWS_REGION }}
+        else
+          echo "Log Group $LOG_GROUP already exists."
+        fi
+
+    - name: Bootstrap ALB Target Group & Rule
+      id: bootstrap-routing
+      run: |
+        TG_NAME="tg-forge-${{ env.APP_NAME }}"
+        # Limit Target Group name length to 32 chars
+        TG_NAME=$(echo "$TG_NAME" | cut -c1-32)
+
+        echo "Checking if Target Group $TG_NAME exists..."
+        TG_ARN=$(aws elbv2 describe-target-groups --names "$TG_NAME" --region ${{ env.AWS_REGION }} --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "not_found")
+
+        if [ "$TG_ARN" = "not_found" ] || [ -z "$TG_ARN" ]; then
+          echo "Creating Target Group $TG_NAME..."
+          TG_ARN=$(aws elbv2 create-target-group \
+            --name "$TG_NAME" \
+            --protocol HTTP \
+            --port 3000 \
+            --vpc-id "${{ env.VPC_ID }}" \
+            --target-type ip \
+            --health-check-path "/" \
+            --health-check-interval-seconds 15 \
+            --health-check-timeout-seconds 5 \
+            --healthy-threshold-count 2 \
+            --unhealthy-threshold-count 3 \
+            --region ${{ env.AWS_REGION }} \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+          echo "Target Group created: $TG_ARN"
+        else
+          echo "Target Group already exists: $TG_ARN"
+        fi
+        echo "TG_ARN=$TG_ARN" >> $GITHUB_ENV
+        echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+
+        HOST_HEADER="${{ env.APP_NAME }}.forgedemo.nmblr.dev"
+        echo "Checking ALB Listener Rule for host $HOST_HEADER..."
+        RULE_ARN=$(aws elbv2 describe-rules \
+          --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+          --region ${{ env.AWS_REGION }} \
+          --query "Rules[?Conditions[?Field=='host-header' && contains(Values, '$HOST_HEADER')]].RuleArn" \
+          --output text 2>/dev/null || echo "")
+
+        if [ -z "$RULE_ARN" ]; then
+          echo "ALB Listener Rule not found. Finding a free priority..."
+          EXISTING_PRIORITIES=$(aws elbv2 describe-rules \
+            --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query "Rules[*].Priority" \
+            --output text)
+
+          PRIORITY=10
+          while echo "$EXISTING_PRIORITIES" | grep -w "$PRIORITY" > /dev/null; do
+            PRIORITY=$((PRIORITY + 1))
+          done
+          echo "Selected priority: $PRIORITY"
+
+          echo "Creating ALB Listener Rule..."
+          aws elbv2 create-rule \
+            --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+            --priority $PRIORITY \
+            --conditions "Field=host-header,Values=$HOST_HEADER" \
+            --actions "Type=forward,TargetGroupArn=$TG_ARN" \
+            --region ${{ env.AWS_REGION }}
+        else
+          echo "ALB Listener Rule already exists: $RULE_ARN"
+        fi
+
+    - name: Register ECS Task Definition
+      id: register-task-def
+      run: |
+        IMAGE_URI="${{ steps.build-image.outputs.image }}"
+        TASK_FAMILY="forge-app-${{ env.APP_NAME }}"
+        LOG_GROUP="/aws/ecs/${{ env.ECS_CLUSTER }}/forge-app-${{ env.APP_NAME }}"
+
+        TASK_DEF_JSON=$(cat <<EOF
+        {
+          "family": "$TASK_FAMILY",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "executionRoleArn": "${{ env.EXECUTION_ROLE_ARN }}",
+          "taskRoleArn": "${{ env.TASK_ROLE_ARN }}",
+          "containerDefinitions": [
+            {
+              "name": "web",
+              "image": "$IMAGE_URI",
+              "essential": true,
+              "portMappings": [
+                {
+                  "containerPort": 3000,
+                  "protocol": "tcp"
+                }
+              ],
+              "environment": [
+                { "name": "DB_HOST", "value": "demo-nmblr-rds.cf3g9ymzt8vn.ap-southeast-1.rds.amazonaws.com" },
+                { "name": "DB_PORT", "value": "5432" },
+                { "name": "DB_USER", "value": "postgres" },
+                { "name": "DB_NAME", "value": "forge_app_${{ env.APP_NAME }}" }
+              ],
+              "secrets": [
+                { "name": "RDS_PASSWORD", "valueFrom": "arn:aws:ssm:${{ env.AWS_REGION }}:163078623513:parameter/forge-demo/rds/master-password" }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "$LOG_GROUP",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+        )
+
+        echo "Registering Task Definition for family $TASK_FAMILY..."
+        TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json "$TASK_DEF_JSON" \
+          --region ${{ env.AWS_REGION }} \
+          --query "taskDefinition.taskDefinitionArn" \
+          --output text)
+        echo "Task Definition registered: $TASK_DEF_ARN"
+        echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+        echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+    - name: Create or Update ECS Service
+      run: |
+        SERVICE_NAME="forge-app-${{ env.APP_NAME }}"
+        TG_ARN="${{ env.TG_ARN }}"
+        TASK_DEF_ARN="${{ env.TASK_DEF_ARN }}"
+
+        echo "Checking if ECS Service $SERVICE_NAME exists in cluster ${{ env.ECS_CLUSTER }}..."
+        if ! aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services "$SERVICE_NAME" --region ${{ env.AWS_REGION }} --query "services[?status=='ACTIVE'].serviceName" --output text | grep -q "$SERVICE_NAME"; then
+          echo "Creating ECS Service $SERVICE_NAME..."
+          aws ecs create-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service-name "$SERVICE_NAME" \
+            --task-definition "$TASK_DEF_ARN" \
+            --launch-type FARGATE \
+            --desired-count 1 \
+            --load-balancers "targetGroupArn=$TG_ARN,containerName=web,containerPort=3000" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNETS }}],securityGroups=[${{ env.SECURITY_GROUPS }}],assignPublicIp=ENABLED}" \
+            --region ${{ env.AWS_REGION }}
+        else
+          echo "Updating ECS Service $SERVICE_NAME..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service "$SERVICE_NAME" \
+            --task-definition "$TASK_DEF_ARN" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNETS }}],securityGroups=[${{ env.SECURITY_GROUPS }}],assignPublicIp=ENABLED}" \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+        fi
+
+        echo "Waiting for service to become stable..."
+        aws ecs wait services-stable --cluster ${{ env.ECS_CLUSTER }} --services "$SERVICE_NAME" --region ${{ env.AWS_REGION }}
+        echo "Deployment completed successfully! Accessible at https://${{ env.APP_NAME }}.forgedemo.nmblr.dev"
